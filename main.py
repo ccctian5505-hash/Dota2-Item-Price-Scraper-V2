@@ -5,25 +5,29 @@ from datetime import datetime
 import pytz
 import os
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ✅ Load from Railway environment
+# ✅ Load from environment (Railway Variables)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# 🔤 Clean up item name to match Steam's formatting
+# 🕒 Get PH time
+def get_ph_time():
+    ph_time = datetime.now(pytz.timezone("Asia/Manila"))
+    return ph_time.strftime("%Y-%m-%d_%H-%M")
+
+# 🔤 Clean up item name
 def clean_item_name(name):
     name = name.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
-    name = unicodedata.normalize("NFKC", name)
-    return name
+    return unicodedata.normalize("NFKC", name)
 
-# 🏷️ Steam price scraper function (PHP currency)
+# 🏷️ Steam price scraper (PHP)
 def get_price(item_name, retries=3):
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {
-        "country": "PH",   # ✅ Philippine region
-        "currency": 12,    # ✅ Peso ₱
-        "appid": 570,      # Dota 2 App ID
+        "country": "PH",
+        "currency": 12,  # PHP
+        "appid": 570,
         "market_hash_name": item_name
     }
 
@@ -32,114 +36,102 @@ def get_price(item_name, retries=3):
         "Accept-Language": "en-US,en;q=0.9"
     }
 
-    for attempt in range(retries):
+    for _ in range(retries):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
-                    return data.get("lowest_price") or data.get("median_price") or "No price listed"
+                    price = data.get("lowest_price") or data.get("median_price") or "No price"
+                    return price
         except Exception:
             pass
         time.sleep(2)
 
     return "Error fetching price"
 
-# 🛎️ Telegram sender (file)
-def send_telegram_file(file_path, token, chat_id):
-    if not token or not chat_id:
-        print("⚠️ Telegram not configured, skipping upload.")
-        return
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
+# 🧮 Clean numeric price
+def extract_numeric_price(price_text):
+    if not price_text or "Error" in price_text or "No" in price_text:
+        return 0.0
+    cleaned = price_text.replace("₱", "").replace("P", "").replace(",", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+# 🛎️ Telegram: send file
+async def send_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_path):
     try:
         with open(file_path, "rb") as doc:
-            response = requests.post(url, data={"chat_id": chat_id}, files={"document": doc})
-        if response.status_code == 200:
-            print("📨 Telegram file sent!")
-        else:
-            print(f"⚠️ Failed to send file: {response.text}")
+            await context.bot.send_document(chat_id=CHAT_ID, document=doc)
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
+        print(f"❌ Error sending file: {e}")
 
-# 🧠 Handle Telegram messages
+# 🚀 Command handler: /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Send me the Dota 2 item names (one per line), and I’ll scrape their Steam prices in PHP.")
+
+# 📩 Message handler: user sends item names
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    items_text = update.message.text.strip()
-    items = [line.strip() for line in items_text.split("\n") if line.strip()]
+    text = update.message.text.strip()
+    items = [line.strip() for line in text.splitlines() if line.strip()]
     if not items:
-        await update.message.reply_text("⚠️ Please send item names, one per line.")
+        await update.message.reply_text("⚠️ Please send valid item names.")
         return
 
-    ph_time = datetime.now(pytz.timezone("Asia/Manila"))
-    now = ph_time.strftime("%Y-%m-%d_%H-%M")
+    now = get_ph_time()
     output_file = f"Price_Checker_Dota2_{now}.txt"
 
-    success_count = 0
-    fail_count = 0
-    total_price_value = 0
-    telegram_message_lines = []
+    results = []
+    total_value = 0.0
+    success = 0
+    failed = 0
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("Source Name\tScraped Name\tPrice (PHP)\n")
-
         for i, item in enumerate(items, start=1):
             clean_name = clean_item_name(item)
             price = get_price(clean_name)
+            numeric_price = extract_numeric_price(price)
 
-            numeric_price = 0
-            if "₱" in price:
-                try:
-                    numeric_price = float(price.replace("₱", "").replace(",", "").strip())
-                    total_price_value += numeric_price
-                    success_count += 1
-                except:
-                    fail_count += 1
-            elif "No price listed" in price or "Error" in price:
-                fail_count += 1
+            if numeric_price > 0:
+                success += 1
+                total_value += numeric_price
             else:
-                success_count += 1
+                failed += 1
 
-            f.write(f"{item}\t{clean_name}\t{price}\n")
-            telegram_message_lines.append(f"{item} → {price}")
+            results.append(f"{item} → {price}")
+            f.write(f"{item}\t{clean_name}\t{numeric_price:.2f}\n")
+
             print(f"{item} → {clean_name} → {price}")
-
             time.sleep(2.5)
+
             if i % 20 == 0:
                 print("⏳ Cooling down for 12 seconds...")
                 time.sleep(12)
 
-    # ✅ Build summary
-    summary_text = (
-        "📊 *Dota 2 Price Summary (PHP)*\n\n"
-        + "\n".join(telegram_message_lines[:40])  # Show up to 40 items
-        + "\n\n"
-        + f"🧾 *Total Items:* {len(items)}\n"
-        + f"✅ *Success:* {success_count}\n"
-        + f"❌ *Failed:* {fail_count}\n"
-        + f"💰 *Total Value:* ₱{total_price_value:,.2f}\n"
+    summary = (
+        "✅ *Dota 2 Price Checker Summary*\n\n"
+        + "\n".join(results[:10])  # show up to 10 items in Telegram
+        + ("\n...and more\n" if len(results) > 10 else "")
+        + f"\n\n💰 *Total Items:* {len(items)}"
+        + f"\n🟢 *Success:* {success}"
+        + f"\n🔴 *Failed:* {failed}"
+        + f"\n💵 *Total Value:* ₱{total_value:,.2f}"
     )
 
-    # ✅ Send Telegram message and file
-    try:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=summary_text, parse_mode="Markdown")
-        send_telegram_file(output_file, BOT_TOKEN, update.effective_chat.id)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Telegram send error: {e}")
+    await update.message.reply_text(summary, parse_mode="Markdown")
+    await send_telegram_file(context, output_file)
 
-# 🚀 Start command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me Dota 2 item names (one per line) to check their prices in PHP!")
-
-# 🏁 Main entry
+# 🧠 Main
 def main():
-    print("🤖 Dota 2 Price Checker Bot is running...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    print("🤖 Dota 2 Price Checker Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
