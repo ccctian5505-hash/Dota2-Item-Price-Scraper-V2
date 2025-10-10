@@ -6,16 +6,11 @@ from datetime import datetime
 import pytz
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import traceback
 
 # === ENVIRONMENT VARIABLES ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-# === TIME CONFIG ===
-ph_time = datetime.now(pytz.timezone("Asia/Manila"))
-now = ph_time.strftime("%Y-%m-%d_%H-%M")
-output_file = f"Price_Checker_Dota2_{now}.txt"
-
 
 # === CLEAN ITEM NAME ===
 def clean_item_name(name):
@@ -55,7 +50,7 @@ def get_price(item_name, retries=3):
     return "Error fetching price"
 
 
-# === TELEGRAM HANDLERS ===
+# === TELEGRAM COMMANDS ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to the Dota 2 Price Checker Bot!\n\n"
@@ -67,77 +62,92 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scrape_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items_text = update.message.text.strip()
-    items = [line.strip() for line in items_text.splitlines() if line.strip()]
+    try:
+        items_text = update.message.text.strip()
+        items = [line.strip() for line in items_text.splitlines() if line.strip()]
 
-    if not items:
-        await update.message.reply_text("⚠️ Please send valid item names (one per line).")
-        return
+        if not items:
+            await update.message.reply_text("⚠️ Please send valid item names (one per line).")
+            return
 
-    # Send loading message
-    loading_msg = await update.message.reply_text(f"⏳ Starting scrape for {len(items)} items...")
+        # Start timing
+        start_time = time.time()
 
-    results = []
-    success_count = 0
-    fail_count = 0
-    total_value = 0.0
+        # Send loading message
+        loading_msg = await update.message.reply_text(f"⏳ Starting scrape for {len(items)} items...")
 
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write("Source Name\tScraped Name\tPrice (PHP)\n")
+        # Prepare output filename (no directory to avoid makedirs error)
+        ph_time = datetime.now(pytz.timezone("Asia/Manila"))
+        now = ph_time.strftime("%Y-%m-%d_%H-%M")
+        output_file = f"Price_Checker_Dota2_{now}.txt"
 
-        for i, item in enumerate(items, start=1):
-            clean_name = clean_item_name(item)
-            price = get_price(clean_name)
+        results = []
+        success_count = 0
+        fail_count = 0
+        total_value = 0.0
 
-            # Remove peso sign and convert for total value
-            price_num = 0.0
-            if price and isinstance(price, str):
-                clean_price = price.replace("₱", "").replace("P", "").replace(",", "").strip()
-                try:
-                    price_num = float(clean_price)
-                    total_value += price_num
-                except ValueError:
-                    pass
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write("Source Name\tScraped Name\tPrice (PHP)\n")
 
-            if price not in ["Error fetching price", "No price listed"]:
-                success_count += 1
-            else:
-                fail_count += 1
+            for i, item in enumerate(items, start=1):
+                clean_name = clean_item_name(item)
+                price = get_price(clean_name)
 
-            results.append(f"{item} → {price}")
-            f.write(f"{item}\t{clean_name}\t{price}\n")
+                # Clean up PHP symbol for total calc
+                price_num = 0.0
+                if price and isinstance(price, str):
+                    clean_price = price.replace("₱", "").replace("P", "").replace(",", "").strip()
+                    try:
+                        price_num = float(clean_price)
+                        total_value += price_num
+                    except ValueError:
+                        pass
 
-            # Progress update every 20 items
-            if i % 20 == 0 or i == len(items):
-                await update.message.reply_text(f"📊 Progress: {i}/{len(items)} items scraped...")
+                if price not in ["Error fetching price", "No price listed"]:
+                    success_count += 1
+                else:
+                    fail_count += 1
 
-            time.sleep(2.5)
+                results.append(f"{item} → {price}")
+                f.write(f"{item}\t{clean_name}\t{price}\n")
 
-    # Delete loading message
-    await loading_msg.delete()
+                # Telegram progress every 20 items
+                if i % 20 == 0 or i == len(items):
+                    await update.message.reply_text(f"📊 Progress: {i}/{len(items)} items scraped...")
 
-    # Send text results in Telegram (split if too long)
-    result_text = "\n".join(results)
-    chunk_size = 3500
-    for i in range(0, len(result_text), chunk_size):
-        await update.message.reply_text(result_text[i:i + chunk_size])
+                time.sleep(2.5)
 
-    # Summary
-    summary = (
-        f"\n✅ *Scraping complete!*\n"
-        f"📦 Total Items: {len(items)}\n"
-        f"✅ Success: {success_count}\n"
-        f"❌ Failed: {fail_count}\n"
-        f"💰 Total Value: ₱{total_value:,.2f}"
-    )
-    await update.message.reply_text(summary, parse_mode="Markdown")
+        # Delete the “loading” message
+        await loading_msg.delete()
 
-    # Send text file
-    await context.bot.send_document(chat_id=update.effective_chat.id, document=open(output_file, "rb"))
+        # Send results (split if long)
+        result_text = "\n".join(results)
+        chunk_size = 3500
+        for i in range(0, len(result_text), chunk_size):
+            await update.message.reply_text(result_text[i:i + chunk_size])
+
+        # Summary with runtime
+        elapsed = time.time() - start_time
+        mins, secs = divmod(int(elapsed), 60)
+        summary = (
+            f"\n✅ *Scraping complete!*\n"
+            f"📦 Total Items: {len(items)}\n"
+            f"✅ Success: {success_count}\n"
+            f"❌ Failed: {fail_count}\n"
+            f"💰 Total Value: ₱{total_value:,.2f}\n"
+            f"⏱ Duration: {mins}m {secs}s"
+        )
+        await update.message.reply_text(summary, parse_mode="Markdown")
+
+        # Send text file
+        await context.bot.send_document(chat_id=update.effective_chat.id, document=open(output_file, "rb"))
+
+    except Exception as e:
+        error_message = f"❌ An error occurred:\n```\n{traceback.format_exc()}\n```"
+        await update.message.reply_text(error_message, parse_mode="Markdown")
 
 
-# === MAIN APP ===
+# === MAIN FUNCTION ===
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
