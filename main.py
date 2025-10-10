@@ -1,43 +1,38 @@
-import os
-import time
 import requests
+import time
 import unicodedata
 from datetime import datetime
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters
+import os
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ✅ Environment Variables (set in Railway)
+# ✅ Load from Railway environment
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN not found. Set it in Railway → Variables tab.")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# 🌏 PH Time
-def ph_time_now():
-    ph_time = datetime.now(pytz.timezone("Asia/Manila"))
-    return ph_time.strftime("%Y-%m-%d_%H-%M")
-
-# 🧼 Clean item name
+# 🔤 Clean up item name to match Steam's formatting
 def clean_item_name(name):
     name = name.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
     name = unicodedata.normalize("NFKC", name)
     return name
 
-# 💰 Steam price fetcher (PHP)
+# 🏷️ Steam price scraper function (PHP currency)
 def get_price(item_name, retries=3):
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {
-        "country": "PH",
-        "currency": 12,  # PHP
-        "appid": 570,    # Dota 2
+        "country": "PH",   # ✅ Philippine region
+        "currency": 12,    # ✅ Peso ₱
+        "appid": 570,      # Dota 2 App ID
         "market_hash_name": item_name
     }
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept-Language": "en-US,en;q=0.9"
     }
 
-    for _ in range(retries):
+    for attempt in range(retries):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=10)
             if response.status_code == 200:
@@ -50,104 +45,101 @@ def get_price(item_name, retries=3):
 
     return "Error fetching price"
 
-# 📁 Scraping core logic
-async def scrape_items(items, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    now = ph_time_now()
+# 🛎️ Telegram sender (file)
+def send_telegram_file(file_path, token, chat_id):
+    if not token or not chat_id:
+        print("⚠️ Telegram not configured, skipping upload.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    try:
+        with open(file_path, "rb") as doc:
+            response = requests.post(url, data={"chat_id": chat_id}, files={"document": doc})
+        if response.status_code == 200:
+            print("📨 Telegram file sent!")
+        else:
+            print(f"⚠️ Failed to send file: {response.text}")
+    except Exception as e:
+        print(f"❌ Telegram error: {e}")
+
+# 🧠 Handle Telegram messages
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    items_text = update.message.text.strip()
+    items = [line.strip() for line in items_text.split("\n") if line.strip()]
+    if not items:
+        await update.message.reply_text("⚠️ Please send item names, one per line.")
+        return
+
+    ph_time = datetime.now(pytz.timezone("Asia/Manila"))
+    now = ph_time.strftime("%Y-%m-%d_%H-%M")
     output_file = f"Price_Checker_Dota2_{now}.txt"
-    total_items = len(items)
-    success, failed, total_value = 0, 0, 0.0
+
+    success_count = 0
+    fail_count = 0
+    total_price_value = 0
+    telegram_message_lines = []
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("Source Name\tScraped Name\tPrice (PHP)\n")
+
         for i, item in enumerate(items, start=1):
             clean_name = clean_item_name(item)
             price = get_price(clean_name)
 
-            print(f"{item} → {clean_name} → {price}")
-
-            if price not in ["Error fetching price", "No price listed"]:
-                success += 1
+            numeric_price = 0
+            if "₱" in price:
                 try:
-                    num = float(price.replace("₱", "").replace(",", "").strip())
-                    total_value += num
+                    numeric_price = float(price.replace("₱", "").replace(",", "").strip())
+                    total_price_value += numeric_price
+                    success_count += 1
                 except:
-                    pass
+                    fail_count += 1
+            elif "No price listed" in price or "Error" in price:
+                fail_count += 1
             else:
-                failed += 1
+                success_count += 1
 
             f.write(f"{item}\t{clean_name}\t{price}\n")
-            time.sleep(2.5)
+            telegram_message_lines.append(f"{item} → {price}")
+            print(f"{item} → {clean_name} → {price}")
 
+            time.sleep(2.5)
             if i % 20 == 0:
                 print("⏳ Cooling down for 12 seconds...")
                 time.sleep(12)
 
-    summary = (
-        f"✅ Dota 2 Price Scraping Complete!\n\n"
-        f"📄 File: {output_file}\n"
-        f"📦 Total Items: {total_items}\n"
-        f"✅ Success: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"💸 Total Value: ₱{round(total_value, 2)}"
+    # ✅ Build summary
+    summary_text = (
+        "📊 *Dota 2 Price Summary (PHP)*\n\n"
+        + "\n".join(telegram_message_lines[:40])  # Show up to 40 items
+        + "\n\n"
+        + f"🧾 *Total Items:* {len(items)}\n"
+        + f"✅ *Success:* {success_count}\n"
+        + f"❌ *Failed:* {fail_count}\n"
+        + f"💰 *Total Value:* ₱{total_price_value:,.2f}\n"
     )
 
-    # Send Telegram message summary
-    await context.bot.send_message(chat_id=chat_id, text=summary)
+    # ✅ Send Telegram message and file
+    try:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=summary_text, parse_mode="Markdown")
+        send_telegram_file(output_file, BOT_TOKEN, update.effective_chat.id)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Telegram send error: {e}")
 
-    # Send result file
-    with open(output_file, "rb") as doc:
-        await context.bot.send_document(chat_id=chat_id, document=doc)
-
-# 🚀 Commands and handlers
-user_items = {}
-
+# 🚀 Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("📝 Input Item Names", callback_data="input_items")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("👋 Welcome to Dota 2 Price Scraper!\n\nPress the button below to begin:", reply_markup=reply_markup)
+    await update.message.reply_text("👋 Send me Dota 2 item names (one per line) to check their prices in PHP!")
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "input_items":
-        await query.message.reply_text("🧾 Send me the item names (one per line).")
-        context.user_data["awaiting_items"] = True
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("awaiting_items"):
-        text = update.message.text.strip()
-        items = [line.strip() for line in text.split("\n") if line.strip()]
-        user_items[update.effective_chat.id] = items
-        context.user_data["awaiting_items"] = False
-
-        keyboard = [[InlineKeyboardButton("🚀 Start Scraping", callback_data="start_scraping")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(f"✅ Got {len(items)} items!\nPress below to start scraping:", reply_markup=reply_markup)
-
-    else:
-        await update.message.reply_text("⚠️ Please use /start first.")
-
-async def handle_scrape_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat.id
-    items = user_items.get(chat_id)
-
-    if not items:
-        await query.message.reply_text("⚠️ No items found. Please send item names first.")
-        return
-
-    await query.message.reply_text("⏳ Scraping in progress, please wait...")
-    await scrape_items(items, chat_id, context)
-
-# 🏁 Run bot
+# 🏁 Main entry
 def main():
+    print("🤖 Dota 2 Price Checker Bot is running...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button, pattern="^input_items$"))
-    app.add_handler(CallbackQueryHandler(handle_scrape_button, pattern="^start_scraping$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     app.run_polling()
 
 if __name__ == "__main__":
