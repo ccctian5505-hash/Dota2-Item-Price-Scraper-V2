@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import requests
 import unicodedata
 from datetime import datetime
@@ -14,18 +15,24 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 # === CLEAN ITEM NAME ===
 def clean_item_name(name):
-    name = name.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    name = (
+        name.replace("’", "'")
+        .replace("‘", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+        .strip()
+    )
     name = unicodedata.normalize("NFKC", name)
-    return name.strip()
+    return name
 
 
-# === SCRAPE PRICE FUNCTION ===
+# === SCRAPE PRICE FUNCTION (Dota 2, PHP) ===
 def get_price(item_name, retries=3):
     url = "https://steamcommunity.com/market/priceoverview/"
     params = {
         "country": "PH",
-        "currency": 12,  # Peso
-        "appid": 570,
+        "currency": 12,  # PHP
+        "appid": 570,    # Dota 2 App ID
         "market_hash_name": item_name,
     }
 
@@ -40,27 +47,29 @@ def get_price(item_name, retries=3):
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
-                    price = data.get("lowest_price") or data.get("median_price") or "No price listed"
-                    if price:
-                        return price
+                    return (
+                        data.get("lowest_price")
+                        or data.get("median_price")
+                        or "No price listed"
+                    )
         except Exception:
             pass
-        time.sleep(2)
-
+        time.sleep(3)
     return "Error fetching price"
 
 
-# === TELEGRAM COMMANDS ===
+# === /start COMMAND ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to the Dota 2 Price Checker Bot!\n\n"
-        "Send me a list of item names (one per line), and I’ll scrape their Steam Market prices in PHP.\n\n"
+        "Send me a list of Dota 2 item names (one per line), and I’ll scrape their Steam Market prices in PHP.\n\n"
         "Example:\n"
-        "```\nProfane Union\nTempest Revelation\nScavenging Guttleslug\n```",
+        "```\nMalefic Drake’s Hood\nProfane Union\nShatterblast Core\n```",
         parse_mode="Markdown",
     )
 
 
+# === SCRAPE ITEMS FROM TELEGRAM ===
 async def scrape_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         items_text = update.message.text.strip()
@@ -70,13 +79,10 @@ async def scrape_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Please send valid item names (one per line).")
             return
 
-        # Start timing
         start_time = time.time()
-
-        # Send loading message
         loading_msg = await update.message.reply_text(f"⏳ Starting scrape for {len(items)} items...")
 
-        # Prepare output filename (no directory to avoid makedirs error)
+        # Prepare output filename
         ph_time = datetime.now(pytz.timezone("Asia/Manila"))
         now = ph_time.strftime("%Y-%m-%d_%H-%M")
         output_file = f"Price_Checker_Dota2_{now}.txt"
@@ -93,10 +99,16 @@ async def scrape_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 clean_name = clean_item_name(item)
                 price = get_price(clean_name)
 
-                # Clean up PHP symbol for total calc
+                # Clean numeric PHP for total calculation
                 price_num = 0.0
-                if price and isinstance(price, str):
-                    clean_price = price.replace("₱", "").replace("P", "").replace(",", "").strip()
+                if isinstance(price, str):
+                    clean_price = (
+                        price.replace("₱", "")
+                        .replace("P", "")
+                        .replace(",", "")
+                        .replace(" ", "")
+                        .strip()
+                    )
                     try:
                         price_num = float(clean_price)
                         total_value += price_num
@@ -111,22 +123,25 @@ async def scrape_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 results.append(f"{item} → {price}")
                 f.write(f"{item}\t{clean_name}\t{price}\n")
 
-                # Telegram progress every 20 items
+                # Random delay per item (3–6s)
+                delay = random.uniform(3, 6)
+                time.sleep(delay)
+
+                # Progress updates every 20 items
                 if i % 20 == 0 or i == len(items):
                     await update.message.reply_text(f"📊 Progress: {i}/{len(items)} items scraped...")
+                    cooldown = random.randint(30, 50)
+                    await update.message.reply_text(f"😴 Cooling down for {cooldown}s to avoid Steam rate limits...")
+                    time.sleep(cooldown)
 
-                time.sleep(2.5)
-
-        # Delete the “loading” message
         await loading_msg.delete()
 
-        # Send results (split if long)
+        # Send results (split long messages)
         result_text = "\n".join(results)
         chunk_size = 3500
         for i in range(0, len(result_text), chunk_size):
             await update.message.reply_text(result_text[i:i + chunk_size])
 
-        # Summary with runtime
         elapsed = time.time() - start_time
         mins, secs = divmod(int(elapsed), 60)
         summary = (
@@ -139,15 +154,14 @@ async def scrape_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(summary, parse_mode="Markdown")
 
-        # Send text file
         await context.bot.send_document(chat_id=update.effective_chat.id, document=open(output_file, "rb"))
 
-    except Exception as e:
+    except Exception:
         error_message = f"❌ An error occurred:\n```\n{traceback.format_exc()}\n```"
         await update.message.reply_text(error_message, parse_mode="Markdown")
 
 
-# === MAIN FUNCTION ===
+# === MAIN ===
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
